@@ -1,7 +1,7 @@
 {
   "name": "redlink-hub",
-  "version": "1.0.0",
-  "description": "Redbox RedLink Hub",
+  "version": "0.4.2",
+  "description": "Redbox RedLink public signaling hub for Render",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
