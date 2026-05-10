@@ -1,11 +1,11 @@
 /* ============================================================
    ФАЙЛ: tools/redlink-render-hub/server.js
-   ВЕРСИЯ ФАЙЛА: 0.1.12
-   ВЕРСИЯ ПРОЕКТА: 0.4.17.3.5.4
+   ВЕРСИЯ ФАЙЛА: 0.1.13
+   ВЕРСИЯ ПРОЕКТА: 0.4.17.3.5.9
    ДАТА: 2026-05-10 Europe/Riga
    АВТОР: Влад.Р
-   НАЗНАЧЕНИЕ: Публичный RedLink Hub для Render/cloud presence, signaling и relay-ticket file transfer.
-   ИЗМЕНЕНИЕ: Cloud RedLink parity: /api/debug/presence, lightweight presence без avatarData/base64, relay-ticket file transfer.
+   НАЗНАЧЕНИЕ: Публичный RedLink Hub для Render/cloud presence, signaling и tracker-метаданных телепорта.
+   ИЗМЕНЕНИЕ: File Teleport Policy Guard: cloud payload relay выключен по умолчанию, hub остаётся tracker/signaling.
    ============================================================ */
 
 const express = require("express");
@@ -18,8 +18,9 @@ const PORT = process.env.PORT || 3737;
 const startedAt = Date.now();
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.REDLINK_HEARTBEAT_TIMEOUT_MS || 60000);
 const SIGNAL_TTL_MS = Number(process.env.REDLINK_SIGNAL_TTL_MS || 120000);
-const VERSION = "0.4.17.3.5.4-render";
+const VERSION = "0.4.17.3.5.9-render";
 const TRANSFER_DIR = path.join(__dirname, "redlink_transfers");
+const ALLOW_CLOUD_FILE_RELAY = process.env.REDBOX_ALLOW_CLOUD_FILE_RELAY === "1" || process.env.REDLINK_ALLOW_CLOUD_FILE_RELAY === "1";
 
 fs.mkdirSync(TRANSFER_DIR, { recursive: true });
 
@@ -240,7 +241,7 @@ function debugPresencePayload() {
     rooms: roomsFromParticipants(dedupedParticipants),
     rawParticipants,
     dedupedParticipants,
-    hint: "Presence is lightweight. avatarData/base64 is intentionally stripped; use avatarAsset/avatarHash and asset transfer."
+    hint: "Presence is lightweight. File payload relay is disabled by default; cloud RedLink is tracker/signaling for File Teleport."
   };
 }
 
@@ -436,7 +437,20 @@ function writeTransferMeta(id, meta) {
   return cleanId;
 }
 
+function cloudFileRelayDisabled(res, action = "file-transfer") {
+  return res.status(403).json({
+    ok: false,
+    service: "redlink-hub",
+    version: VERSION,
+    action,
+    error: "cloud_file_relay_disabled",
+    policy: "file_teleport_direct_p2p_default",
+    hint: "Cloud RedLink is tracker/signaling only. Enable REDBOX_ALLOW_CLOUD_FILE_RELAY=1 only for explicit temporary fallback tests."
+  });
+}
+
 app.post("/api/redlink/file-transfer/start", (req, res) => {
+  if (!ALLOW_CLOUD_FILE_RELAY) return cloudFileRelayDisabled(res, "file-transfer-start");
   const payload = payloadFrom(req);
   const transferId = safeTransferId(payload.transferId);
   const fileName = safeFileName(payload.fileName);
@@ -467,6 +481,7 @@ app.post("/api/redlink/file-transfer/start", (req, res) => {
 });
 
 app.post("/api/redlink/file-transfer/chunk", (req, res) => {
+  if (!ALLOW_CLOUD_FILE_RELAY) return cloudFileRelayDisabled(res, "file-transfer-chunk");
   const payload = payloadFrom(req);
   const transferId = safeTransferId(payload.transferId);
   const meta = readTransferMeta(transferId);
@@ -486,6 +501,7 @@ app.post("/api/redlink/file-transfer/chunk", (req, res) => {
 });
 
 app.post("/api/redlink/file-transfer/complete", (req, res) => {
+  if (!ALLOW_CLOUD_FILE_RELAY) return cloudFileRelayDisabled(res, "file-transfer-complete");
   const payload = payloadFrom(req);
   const transferId = safeTransferId(payload.transferId);
   const meta = readTransferMeta(transferId);
@@ -498,6 +514,7 @@ app.post("/api/redlink/file-transfer/complete", (req, res) => {
 });
 
 app.get("/api/redlink/file-transfer/meta/:transferId", (req, res) => {
+  if (!ALLOW_CLOUD_FILE_RELAY) return cloudFileRelayDisabled(res, "file-transfer-meta");
   const transferId = safeTransferId(req.params.transferId);
   const meta = readTransferMeta(transferId);
   if (!meta) return res.status(404).json({ ok: false, error: "unknown transferId", transferId });
@@ -505,6 +522,7 @@ app.get("/api/redlink/file-transfer/meta/:transferId", (req, res) => {
 });
 
 app.get("/api/redlink/file-transfer/download/:transferId", (req, res) => {
+  if (!ALLOW_CLOUD_FILE_RELAY) return cloudFileRelayDisabled(res, "file-transfer-download");
   const transferId = safeTransferId(req.params.transferId);
   const meta = readTransferMeta(transferId);
   const payloadPath = transferPayloadPath(transferId);
