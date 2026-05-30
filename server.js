@@ -12,14 +12,13 @@ const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
-const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3737;
 const startedAt = Date.now();
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.REDLINK_HEARTBEAT_TIMEOUT_MS || 60000);
 const SIGNAL_TTL_MS = Number(process.env.REDLINK_SIGNAL_TTL_MS || 120000);
-const VERSION = "0.5.0.8.1-render-signal-guard";
+const VERSION = "0.4.17.3.5.9-render";
 const TRANSFER_DIR = path.join(__dirname, "redlink_transfers");
 const ALLOW_CLOUD_FILE_RELAY = process.env.REDBOX_ALLOW_CLOUD_FILE_RELAY === "1" || process.env.REDLINK_ALLOW_CLOUD_FILE_RELAY === "1";
 
@@ -28,7 +27,6 @@ fs.mkdirSync(TRANSFER_DIR, { recursive: true });
 app.use(cors());
 app.use(express.json({ limit: "8mb" }));
 app.use(express.urlencoded({ extended: true, limit: "8mb" }));
-app.use('/portal', express.static(path.join(__dirname, 'public/portal')));
 
 let participants = [];
 let signals = [];
@@ -250,27 +248,22 @@ function debugPresencePayload() {
 app.get("/", (_req, res) => res.json(healthPayload()));
 app.get("/health", (_req, res) => res.json(healthPayload()));
 app.get("/api/health", (_req, res) => res.json(healthPayload()));
+app.get("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
+app.post("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
 
-function debugSignalsPayload() {
+app.get("/api/debug/signals", (_req, res) => {
   cleanup();
-  return {
+
+  res.json({
     ok: true,
     service: "redlink-hub",
     version: VERSION,
     layer: "signals-debug",
     generatedAt: now(),
     signalCount: signals.length,
-    signals: signals.map((signal) => ({
-      ...signal,
-      ageMs: now() - Number(signal.sentAt || 0)
-    }))
-  };
-}
-
-app.get("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
-app.post("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
-app.get("/api/debug/signals", (_req, res) => res.json(debugSignalsPayload()));
-app.post("/api/debug/signals", (_req, res) => res.json(debugSignalsPayload()));
+    signals
+  });
+});
 
 function handleRegister(req, res) {
   const self = upsertParticipant(payloadFrom(req));
@@ -384,7 +377,6 @@ function handleRedLinkSignal(req, res) {
 
   if (type === "dm") {
     data = stripHeavyPresenceData({
-      actionId: cleanString(payload.actionId || payload.messageId || payload.id),
       message: cleanString(payload.message || payload.payload),
       payload: cleanString(payload.payload || payload.message),
       fromName: cleanString(payload.fromName || payload.nickname || payload.name),
@@ -407,7 +399,6 @@ function handleRedLinkSignal(req, res) {
     from: cleanString(payload.from || payload.fromInstanceId || payload.instanceId),
     to: cleanString(payload.to || payload.toInstanceId),
     type,
-    actionId: cleanString(payload.actionId || (data && data.actionId)),
     data,
     sentAt: now()
   };
@@ -427,13 +418,6 @@ app.get("/api/redlink/poll", (req, res) => {
   const inbox = signals.filter((signal) => signal.roomKey === roomKey
     && (!signal.to || signal.to === instanceId)
     && signal.from !== instanceId);
-
-  // 0.5.0.8.1: targeted RedLink signals behave as a lightweight mailbox, not an endless broadcast log.
-  // Once a target polls them, remove them from the hub so old DM retries do not flood the UI forever.
-  signals = signals.filter((signal) => !(signal.roomKey === roomKey
-    && signal.to === instanceId
-    && signal.from !== instanceId));
-
   res.json({ ok: true, service: "redlink-hub", version: VERSION, layer: "redlink-signaling-poll", roomKey, instanceId, signals: inbox, generatedAt: now() });
 });
 
