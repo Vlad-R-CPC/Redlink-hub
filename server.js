@@ -250,8 +250,27 @@ function debugPresencePayload() {
 app.get("/", (_req, res) => res.json(healthPayload()));
 app.get("/health", (_req, res) => res.json(healthPayload()));
 app.get("/api/health", (_req, res) => res.json(healthPayload()));
+
+function debugSignalsPayload() {
+  cleanup();
+  return {
+    ok: true,
+    service: "redlink-hub",
+    version: VERSION,
+    layer: "signals-debug",
+    generatedAt: now(),
+    signalCount: signals.length,
+    signals: signals.map((signal) => ({
+      ...signal,
+      ageMs: now() - Number(signal.sentAt || 0)
+    }))
+  };
+}
+
 app.get("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
 app.post("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
+app.get("/api/debug/signals", (_req, res) => res.json(debugSignalsPayload()));
+app.post("/api/debug/signals", (_req, res) => res.json(debugSignalsPayload()));
 
 function handleRegister(req, res) {
   const self = upsertParticipant(payloadFrom(req));
@@ -546,7 +565,7 @@ app.use((req, res) => {
     ok: false,
     error: "route_not_found",
     path: req.path,
-    available: ["/", "/health", "/api/health", "/api/debug/presence", "/api/presence", "/api/register", "/api/native/register", "/api/native/heartbeat", "/api/native/goodbye", "/api/redlink/discover", "/api/redlink/signal", "/api/redlink/poll", "/api/redlink/file-transfer/start", "/api/redlink/file-transfer/chunk", "/api/redlink/file-transfer/complete", "/api/redlink/file-transfer/download/:transferId"]
+    available: ["/", "/health", "/api/health", "/api/debug/presence", "/api/debug/signals", "/api/presence", "/api/register", "/api/native/register", "/api/native/heartbeat", "/api/native/goodbye", "/api/redlink/discover", "/api/redlink/signal", "/api/redlink/poll", "/api/redlink/file-transfer/start", "/api/redlink/file-transfer/chunk", "/api/redlink/file-transfer/complete", "/api/redlink/file-transfer/download/:transferId"]
   });
 });
 
