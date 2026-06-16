@@ -1,13 +1,10 @@
 /* ============================================================
-   ФАЙЛ: tools/redlink-render-hub/server.js
-   ВЕРСИЯ ФАЙЛА: 0.1.14
-   ВЕРСИЯ ПРОЕКТА: 0.5.0.8.2
-   ДАТА: 2026-05-10 Europe/Riga
-   АВТОР: Влад.Р
-   НАЗНАЧЕНИЕ: Публичный RedLink Hub для Render/cloud presence, signaling и tracker-метаданных телепорта.
-   ИЗМЕНЕНИЕ: Debug signals + targeted signal poll cleanup: временный диагностический endpoint и удаление адресных сигналов после poll.
+   FILE: tools/redlink-render-hub/server.js
+   PROJECT VERSION: 0.5.0.9
+   DATE: 2026-06-16 Europe/Moscow
+   PURPOSE: Public RedLink Hub for lightweight presence, signaling and discovery only.
+   CHANGE: Bandwidth guard after Render free bandwidth suspension: debug endpoints are dev/auth-only; cloud file relay is hard-disabled; payload/history/queue data is compacted; TTL, pruning, poll limits and backoff are enforced.
    ============================================================ */
-
 const express = require("express");
 const cors = require("cors");
 const fs = require("fs");
@@ -18,21 +15,191 @@ const PORT = process.env.PORT || 3737;
 const startedAt = Date.now();
 const HEARTBEAT_TIMEOUT_MS = Number(process.env.REDLINK_HEARTBEAT_TIMEOUT_MS || 60000);
 const SIGNAL_TTL_MS = Number(process.env.REDLINK_SIGNAL_TTL_MS || 120000);
-const VERSION = "0.5.0.8.1-render-signal-guard";
+const SIGNAL_MAX_AGE_MS = Math.min(SIGNAL_TTL_MS, Number(process.env.REDLINK_SIGNAL_MAX_AGE_MS || 120000));
+const MAX_SIGNALS = Math.max(32, Number(process.env.REDLINK_MAX_SIGNALS || 600));
+const MAX_POLL_SIGNALS = Math.max(1, Math.min(50, Number(process.env.REDLINK_MAX_POLL_SIGNALS || 20)));
+const MAX_PRESENCE_MEMBERS = Math.max(4, Math.min(200, Number(process.env.REDLINK_MAX_PRESENCE_MEMBERS || 80)));
+const MAX_SIGNAL_DATA_BYTES = Math.max(1024, Math.min(32768, Number(process.env.REDLINK_MAX_SIGNAL_DATA_BYTES || 16384)));
+const MAX_RESPONSE_BYTES = Math.max(4096, Math.min(262144, Number(process.env.REDLINK_MAX_RESPONSE_BYTES || 65536)));
+const MAX_SIGNAL_STORE_BYTES = Math.max(65536, Math.min(4194304, Number(process.env.REDLINK_MAX_SIGNAL_STORE_BYTES || 1048576)));
+const POLL_RETRY_AFTER_MS = Math.max(1000, Number(process.env.REDLINK_POLL_RETRY_AFTER_MS || 5000));
+const DEBUG_ENABLED = process.env.REDLINK_DEBUG === "1" || process.env.NODE_ENV === "development";
+const DEBUG_TOKEN = cleanString(process.env.REDLINK_DEBUG_TOKEN);
+const DEBUG_ALLOW_NO_TOKEN = process.env.REDLINK_DEBUG_ALLOW_NO_TOKEN === "1";
+const BANDWIDTH_BUCKET_MS = Math.max(60000, Number(process.env.REDLINK_BANDWIDTH_BUCKET_MS || 300000));
+const BANDWIDTH_MAX_BUCKETS = Math.max(3, Math.min(288, Number(process.env.REDLINK_BANDWIDTH_MAX_BUCKETS || 36)));
+const VERSION = "0.5.0.9-bandwidth-guard";
 const TRANSFER_DIR = path.join(__dirname, "redlink_transfers");
-const ALLOW_CLOUD_FILE_RELAY = process.env.REDBOX_ALLOW_CLOUD_FILE_RELAY === "1" || process.env.REDLINK_ALLOW_CLOUD_FILE_RELAY === "1";
+const ALLOW_CLOUD_FILE_RELAY = false;
 
 fs.mkdirSync(TRANSFER_DIR, { recursive: true });
 
 app.use(cors());
-app.use(express.json({ limit: "8mb" }));
-app.use(express.urlencoded({ extended: true, limit: "8mb" }));
+app.use(rateLimit);
+app.use((req, res, next) => {
+  const started = now();
+  let responseBytes = 0;
+  const originalWrite = res.write.bind(res);
+  const originalEnd = res.end.bind(res);
+  res.write = (chunk, encoding, callback) => {
+    if (chunk) responseBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk), encoding);
+    return originalWrite(chunk, encoding, callback);
+  };
+  res.end = (chunk, encoding, callback) => {
+    if (chunk) responseBytes += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(String(chunk), encoding);
+    recordBandwidth(req, res.statusCode, responseBytes, now() - started);
+    return originalEnd(chunk, encoding, callback);
+  };
+  return next();
+});
+app.use(express.json({ limit: process.env.REDLINK_BODY_LIMIT || "64kb" }));
+app.use(express.urlencoded({ extended: true, limit: process.env.REDLINK_BODY_LIMIT || "64kb" }));
 
 let participants = [];
 let signals = [];
+let requestBuckets = new Map();
+let bandwidthBuckets = new Map();
 
 function now() {
   return Date.now();
+}
+function rateLimit(req, res, next) {
+  const windowMs = Math.max(1000, Number(process.env.REDLINK_RATE_WINDOW_MS || 60000));
+  const maxRequests = Math.max(30, Number(process.env.REDLINK_RATE_MAX || 240));
+  const key = cleanString(req.ip || req.headers["x-forwarded-for"] || "unknown").slice(0, 80);
+  const current = now();
+  const bucket = requestBuckets.get(key) || { count: 0, resetAt: current + windowMs };
+  if (current > bucket.resetAt) {
+    bucket.count = 0;
+    bucket.resetAt = current + windowMs;
+  }
+  bucket.count += 1;
+  requestBuckets.set(key, bucket);
+  if (requestBuckets.size > 1000) requestBuckets = new Map([...requestBuckets.entries()].slice(-500));
+  if (bucket.count > maxRequests) {
+    const retryAfterMs = Math.max(1000, bucket.resetAt - current);
+    res.set("Retry-After", String(Math.ceil(retryAfterMs / 1000)));
+    return res.status(429).json({ ok: false, error: "rate_limited", retryAfterMs });
+  }
+  return next();
+}
+
+function hashClient(value) {
+  const text = cleanString(value, "unknown");
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `h${(hash >>> 0).toString(16)}`;
+}
+
+function compactPath(pathValue) {
+  const text = cleanString(pathValue, "/");
+  return text.replace(/\/api\/redlink\/file-transfer\/(?:meta|download)\/[^/?#]+/g, "/api/redlink/file-transfer/:kind/:transferId");
+}
+
+function recordBandwidth(req, statusCode, responseBytes, elapsedMs) {
+  const bucketStart = Math.floor(now() / BANDWIDTH_BUCKET_MS) * BANDWIDTH_BUCKET_MS;
+  const pathKey = compactPath(req.path || req.url || "/");
+  const clientHash = hashClient(`${req.ip || ""}|${req.get("user-agent") || ""}|${req.query.instanceId || req.query.clientId || req.query.to || ""}`);
+  const bucket = bandwidthBuckets.get(bucketStart) || {
+    bucketStart,
+    requestCount: 0,
+    responseBytes: 0,
+    endpoints: {},
+    clients: {}
+  };
+  bucket.requestCount += 1;
+  bucket.responseBytes += responseBytes;
+  const endpoint = bucket.endpoints[pathKey] || { requests: 0, responseBytes: 0, status: {} };
+  endpoint.requests += 1;
+  endpoint.responseBytes += responseBytes;
+  endpoint.status[String(statusCode || 0)] = (endpoint.status[String(statusCode || 0)] || 0) + 1;
+  bucket.endpoints[pathKey] = endpoint;
+  const client = bucket.clients[clientHash] || { requests: 0, responseBytes: 0 };
+  client.requests += 1;
+  client.responseBytes += responseBytes;
+  bucket.clients[clientHash] = client;
+  bandwidthBuckets.set(bucketStart, bucket);
+  const keys = [...bandwidthBuckets.keys()].sort((a, b) => a - b);
+  while (keys.length > BANDWIDTH_MAX_BUCKETS) {
+    bandwidthBuckets.delete(keys.shift());
+  }
+}
+
+function bandwidthSummary(limit = 10) {
+  const buckets = [...bandwidthBuckets.values()].sort((a, b) => a.bucketStart - b.bucketStart);
+  const total = { requests: 0, responseBytes: 0 };
+  const endpoints = {};
+  const clients = {};
+  for (const bucket of buckets) {
+    total.requests += bucket.requestCount;
+    total.responseBytes += bucket.responseBytes;
+    for (const [pathKey, value] of Object.entries(bucket.endpoints)) {
+      const item = endpoints[pathKey] || { requests: 0, responseBytes: 0 };
+      item.requests += value.requests;
+      item.responseBytes += value.responseBytes;
+      endpoints[pathKey] = item;
+    }
+    for (const [clientHash, value] of Object.entries(bucket.clients)) {
+      const item = clients[clientHash] || { requests: 0, responseBytes: 0 };
+      item.requests += value.requests;
+      item.responseBytes += value.responseBytes;
+      clients[clientHash] = item;
+    }
+  }
+  const topEndpoints = Object.entries(endpoints)
+    .map(([endpoint, value]) => ({ endpoint, ...value }))
+    .sort((a, b) => b.responseBytes - a.responseBytes)
+    .slice(0, limit);
+  const topClients = Object.entries(clients)
+    .map(([clientHash, value]) => ({ clientHash, ...value }))
+    .sort((a, b) => b.responseBytes - a.responseBytes)
+    .slice(0, limit);
+  return {
+    windowBuckets: buckets.length,
+    bucketMs: BANDWIDTH_BUCKET_MS,
+    total,
+    topEndpoints,
+    topClients
+  };
+}
+
+function publicBoardStatus() {
+  const summary = bandwidthSummary(8);
+  return {
+    ok: true,
+    service: "redlink-hub",
+    version: VERSION,
+    role: "public-lightweight-board",
+    policy: {
+      noFiles: true,
+      noHistory: true,
+      noBase64: true,
+      noFullDumps: true,
+      noCloudPayloadRelay: true
+    },
+    limits: {
+      signalTtlMs: SIGNAL_MAX_AGE_MS,
+      maxSignals: MAX_SIGNALS,
+      maxPollSignals: MAX_POLL_SIGNALS,
+      maxPresenceMembers: MAX_PRESENCE_MEMBERS,
+      maxSignalDataBytes: MAX_SIGNAL_DATA_BYTES,
+      maxResponseBytes: MAX_RESPONSE_BYTES,
+      maxSignalStoreBytes: MAX_SIGNAL_STORE_BYTES,
+      pollRetryAfterMs: POLL_RETRY_AFTER_MS
+    },
+    counters: {
+      participants: dedupeParticipants(participants).length,
+      rawParticipants: participants.length,
+      signals: signals.length,
+      bandwidthRequests: summary.total.requests,
+      bandwidthResponseBytes: summary.total.responseBytes
+    },
+    topEndpoints: summary.topEndpoints,
+    generatedAt: now()
+  };
 }
 
 function makeId(prefix) {
@@ -45,6 +212,110 @@ function cleanString(value, fallback = "") {
 
 function safeSlice(value, length = 512) {
   return cleanString(value).slice(0, length);
+}
+
+function intParam(value, fallback, min, max) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(parsed)));
+}
+
+function utf8Bytes(value) {
+  return Buffer.byteLength(String(value ?? ""), "utf8");
+}
+
+function compactValue(value, maxBytes = MAX_SIGNAL_DATA_BYTES, depth = 0) {
+  if (value == null) return value;
+  if (depth > 6) return "[depth-stripped]";
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => compactValue(item, Math.floor(maxBytes / 2), depth + 1));
+  if (typeof value === "object") {
+    const out = {};
+    for (const [key, innerValue] of Object.entries(value)) {
+      const lower = String(key).toLowerCase();
+      if (lower.includes("payload") || lower.includes("history") || lower.includes("queue")
+          || lower.includes("base64") || lower.includes("chunk") || lower.includes("body")
+          || lower.includes("avatar") || lower.includes("image") || lower.includes("thumbnail")
+          || lower.includes("preview")) {
+        out[`${key}Stripped`] = true;
+        continue;
+      }
+      out[key] = compactValue(innerValue, Math.floor(maxBytes / 2), depth + 1);
+    }
+    return out;
+  }
+  const text = String(value);
+  if (utf8Bytes(text) <= maxBytes) return text;
+  return text.slice(0, Math.max(64, maxBytes)) + "...[truncated]";
+}
+
+function compactSignal(signal = {}, includeData = true) {
+  const out = {
+    id: signal.id || "",
+    roomKey: signal.roomKey || "",
+    from: signal.from || "",
+    to: signal.to || "",
+    type: signal.type || "probe",
+    actionId: signal.actionId || "",
+    sentAt: signal.sentAt || 0,
+    expiresAt: Number(signal.sentAt || 0) + SIGNAL_MAX_AGE_MS
+  };
+  if (includeData) out.data = compactValue(signal.data || {}, MAX_SIGNAL_DATA_BYTES);
+  return out;
+}
+
+function boundedSignalsForResponse(list, includeData = true, maxBytes = MAX_RESPONSE_BYTES) {
+  const out = [];
+  let used = 2;
+  for (const signal of list) {
+    const compact = compactSignal(signal, includeData);
+    const bytes = utf8Bytes(JSON.stringify(compact)) + 1;
+    if (out.length > 0 && used + bytes > maxBytes) break;
+    out.push(compact);
+    used += bytes;
+  }
+  return out;
+}
+
+function compactParticipant(participant = {}) {
+  return {
+    instanceId: participant.instanceId || participant.clientId || "",
+    clientId: participant.clientId || participant.instanceId || "",
+    nickname: participant.nickname || participant.name || "",
+    name: participant.name || participant.nickname || "",
+    status: participant.status || "online",
+    activity: safeSlice(participant.activity || "native-redbox", 96),
+    workspaceId: participant.workspaceId || "redbox-test",
+    projectId: participant.projectId || "main",
+    roomId: participant.roomId || "lobby",
+    roomKey: participant.roomKey || "redbox-test/main/lobby",
+    lastSeen: participant.lastSeen || 0,
+    transport: participant.transport || "render-http"
+  };
+}
+
+function requireDebug(req, res, next) {
+  if (!DEBUG_ENABLED) {
+    return res.status(404).json({ ok: false, error: "route_not_found", path: req.path });
+  }
+  const token = cleanString(req.get("x-redlink-debug-token") || req.query.debugToken || req.query.token);
+  if (!DEBUG_TOKEN && !DEBUG_ALLOW_NO_TOKEN) {
+    return res.status(403).json({ ok: false, error: "debug_token_not_configured" });
+  }
+  if (DEBUG_TOKEN && token !== DEBUG_TOKEN) {
+    return res.status(403).json({ ok: false, error: "debug_auth_required" });
+  }
+  return next();
+}
+
+function pruneSignals() {
+  const cutoff = now() - SIGNAL_MAX_AGE_MS;
+  signals = signals.filter((s) => Number(s.sentAt || 0) >= cutoff);
+  if (signals.length > MAX_SIGNALS) signals = signals.slice(signals.length - MAX_SIGNALS);
+  let storeBytes = utf8Bytes(JSON.stringify(signals.map((signal) => compactSignal(signal, true))));
+  while (signals.length > 1 && storeBytes > MAX_SIGNAL_STORE_BYTES) {
+    signals.shift();
+    storeBytes = utf8Bytes(JSON.stringify(signals.map((signal) => compactSignal(signal, true))));
+  }
 }
 
 function roomKeyFrom(payload = {}) {
@@ -148,9 +419,7 @@ function publicParticipant(participant = {}) {
 function cleanup() {
   const participantCutoff = now() - HEARTBEAT_TIMEOUT_MS;
   participants = participants.filter((p) => Number(p.lastSeen || 0) >= participantCutoff);
-
-  const signalCutoff = now() - SIGNAL_TTL_MS;
-  signals = signals.filter((s) => Number(s.sentAt || 0) >= signalCutoff);
+  pruneSignals();
 }
 
 function removeOlderMachineClones(instanceId, machineFingerprint) {
@@ -191,9 +460,13 @@ function roomsFromParticipants(list) {
   const rooms = {};
   for (const participant of list) {
     if (!rooms[participant.roomKey]) rooms[participant.roomKey] = [];
-    rooms[participant.roomKey].push(participant);
+    if (rooms[participant.roomKey].length < MAX_PRESENCE_MEMBERS) rooms[participant.roomKey].push(compactParticipant(participant));
   }
   return rooms;
+}
+
+function limitedParticipants(list, limit = MAX_PRESENCE_MEMBERS) {
+  return list.slice(0, limit).map(compactParticipant);
 }
 
 function healthPayload() {
@@ -205,6 +478,12 @@ function healthPayload() {
     participants: visibleParticipants.length,
     rawParticipants: participants.length,
     signals: signals.length,
+    debugEnabled: DEBUG_ENABLED,
+    cloudFileRelayEnabled: ALLOW_CLOUD_FILE_RELAY,
+    signalTtlMs: SIGNAL_MAX_AGE_MS,
+    maxSignals: MAX_SIGNALS,
+    maxResponseBytes: MAX_RESPONSE_BYTES,
+    pollRetryAfterMs: POLL_RETRY_AFTER_MS,
     startedAt,
     timestamp: now()
   };
@@ -213,9 +492,9 @@ function healthPayload() {
 function debugPresencePayload() {
   cleanup();
   const rawParticipants = participants
-    .map((p) => ({ ...publicParticipant(p), ageMs: now() - Number(p.lastSeen || 0), stale: Number(p.lastSeen || 0) < now() - HEARTBEAT_TIMEOUT_MS }))
+    .map((p) => ({ ...compactParticipant(p), ageMs: now() - Number(p.lastSeen || 0), stale: Number(p.lastSeen || 0) < now() - HEARTBEAT_TIMEOUT_MS }))
     .sort((a, b) => String(a.roomKey).localeCompare(String(b.roomKey)) || String(a.name).localeCompare(String(b.name)));
-  const dedupedParticipants = dedupeParticipants(participants);
+  const dedupedParticipants = dedupeParticipants(participants).map(compactParticipant);
 
   let transferCount = 0;
   try {
@@ -248,10 +527,35 @@ function debugPresencePayload() {
 app.get("/", (_req, res) => res.json(healthPayload()));
 app.get("/health", (_req, res) => res.json(healthPayload()));
 app.get("/api/health", (_req, res) => res.json(healthPayload()));
-app.get("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
-app.post("/api/debug/presence", (_req, res) => res.json(debugPresencePayload()));
-app.get("/api/debug/signals", (_req, res) => {
+app.get("/api/board/status", (_req, res) => res.json(publicBoardStatus()));
+app.get("/api/diagnostics/bandwidth", (_req, res) => res.json({
+  ok: true,
+  service: "redlink-hub",
+  version: VERSION,
+  layer: "public-bandwidth-aggregate",
+  summary: bandwidthSummary(8),
+  generatedAt: now()
+}));
+app.get("/api/debug/presence", requireDebug, (req, res) => {
+  const payload = debugPresencePayload();
+  res.json({
+    ...payload,
+    rawParticipants: payload.rawParticipants.slice(0, intParam(req.query.limit, 25, 1, 100))
+  });
+});
+app.post("/api/debug/presence", requireDebug, (req, res) => {
+  const payload = debugPresencePayload();
+  res.json({
+    ...payload,
+    rawParticipants: payload.rawParticipants.slice(0, intParam(req.query.limit, 25, 1, 100))
+  });
+});
+app.get("/api/debug/signals", requireDebug, (req, res) => {
   cleanup();
+  const limit = intParam(req.query.limit, 20, 1, 100);
+  const offset = intParam(req.query.offset, 0, 0, Math.max(0, signals.length));
+  const includeData = cleanString(req.query.includeData) === "1";
+  const page = boundedSignalsForResponse(signals.slice(offset, offset + limit), includeData);
   res.json({
     ok: true,
     service: "redlink-hub",
@@ -259,22 +563,39 @@ app.get("/api/debug/signals", (_req, res) => {
     layer: "signals-debug",
     generatedAt: now(),
     signalCount: signals.length,
-    signals
+    warning: signals.length > Math.floor(MAX_SIGNALS * 0.8) ? "signal_store_near_cap" : "",
+    limit,
+    offset,
+    hasMore: offset + limit < signals.length,
+    signals: page,
+    boundedByBytes: MAX_RESPONSE_BYTES
+  });
+});
+
+app.get("/api/debug/bandwidth", requireDebug, (req, res) => {
+  res.json({
+    ok: true,
+    service: "redlink-hub",
+    version: VERSION,
+    layer: "bandwidth-debug",
+    generatedAt: now(),
+    summary: bandwidthSummary(intParam(req.query.limit, 10, 1, 50))
   });
 });
 
 function handleRegister(req, res) {
   const self = upsertParticipant(payloadFrom(req));
-  const visibleParticipants = dedupeParticipants(participants);
+  const visibleParticipants = limitedParticipants(dedupeParticipants(participants));
   res.json({
     ok: true,
     service: "redlink-hub",
     version: VERSION,
     action: "register-writeback",
-    self: publicParticipant(self),
+    self: compactParticipant(self),
     clients: visibleParticipants.length,
     participants: visibleParticipants,
     members: visibleParticipants,
+    limit: MAX_PRESENCE_MEMBERS,
     generatedAt: now()
   });
 }
@@ -292,7 +613,7 @@ function handleGoodbye(req, res) {
   if (instanceId)
     participants = participants.filter((p) => cleanString(p.instanceId || p.clientId) !== instanceId);
 
-  const visibleParticipants = dedupeParticipants(participants);
+  const visibleParticipants = limitedParticipants(dedupeParticipants(participants));
   res.json({
     ok: true,
     service: "redlink-hub",
@@ -302,6 +623,7 @@ function handleGoodbye(req, res) {
     clients: visibleParticipants.length,
     participants: visibleParticipants,
     members: visibleParticipants,
+    limit: MAX_PRESENCE_MEMBERS,
     generatedAt: now()
   });
 }
@@ -314,7 +636,7 @@ function handlePresence(req, res) {
   if (cleanString(payload.instanceId || payload.clientId))
     upsertParticipant({ ...payload, activity: payload.activity || "presence-heartbeat" });
 
-  const visibleParticipants = dedupeParticipants(participants);
+  const visibleParticipants = limitedParticipants(dedupeParticipants(participants));
   const rooms = roomsFromParticipants(visibleParticipants);
   const roomKey = Object.keys(rooms).sort()[0] || "redbox-test/main/lobby";
   res.json({
@@ -327,6 +649,8 @@ function handlePresence(req, res) {
     participants: visibleParticipants,
     members: visibleParticipants,
     rooms,
+    limit: MAX_PRESENCE_MEMBERS,
+    retryAfterMs: POLL_RETRY_AFTER_MS,
     time: now()
   });
 }
@@ -337,10 +661,11 @@ app.post("/api/presence", handlePresence);
 function handleRedLinkDiscover(req, res) {
   const payload = payloadFrom(req);
   const self = upsertParticipant({ ...payload, activity: payload.activity || "redlink-discovery" });
-  const visibleParticipants = dedupeParticipants(participants);
+  const visibleParticipants = limitedParticipants(dedupeParticipants(participants));
   const peers = visibleParticipants
     .filter((p) => p.roomKey === self.roomKey)
-    .filter((p) => p.instanceId !== self.instanceId);
+    .filter((p) => p.instanceId !== self.instanceId)
+    .slice(0, MAX_PRESENCE_MEMBERS);
 
   res.json({
     ok: true,
@@ -349,9 +674,11 @@ function handleRedLinkDiscover(req, res) {
     layer: "redlink-discovery",
     roomKey: self.roomKey,
     generatedAt: now(),
-    self: publicParticipant(self),
+    self: compactParticipant(self),
     peers,
     peerCount: peers.length,
+    limit: MAX_PRESENCE_MEMBERS,
+    retryAfterMs: POLL_RETRY_AFTER_MS,
     signaling: {
       endpoints: {
         discover: "/api/redlink/discover",
@@ -374,22 +701,26 @@ function handleRedLinkSignal(req, res) {
   data = stripHeavyPresenceData(parseMaybeJson(data));
 
   if (type === "dm") {
-    data = stripHeavyPresenceData({
+    data = compactValue({
       actionId: cleanString(payload.actionId || payload.messageId || payload.id),
-      message: cleanString(payload.message || payload.payload),
-      payload: cleanString(payload.payload || payload.message),
-      fromName: cleanString(payload.fromName || payload.nickname || payload.name),
-      toName: cleanString(payload.toName),
+      message: safeSlice(payload.message || payload.payload, 1024),
+      fromName: safeSlice(payload.fromName || payload.nickname || payload.name, 96),
+      toName: safeSlice(payload.toName, 96),
       createdAt: now()
     });
   }
 
   if (type === "box_discussion") {
-    data = stripHeavyPresenceData(payload.data || payload.payload || {
-      message: cleanString(payload.message),
-      fromName: cleanString(payload.fromName || payload.nickname || payload.name),
+    data = compactValue({
+      actionId: cleanString(payload.actionId || payload.messageId || payload.id),
+      message: safeSlice(payload.message, 1024),
+      fromName: safeSlice(payload.fromName || payload.nickname || payload.name, 96),
       createdAt: now()
     });
+  }
+
+  if (type !== "dm" && type !== "box_discussion") {
+    data = compactValue(data, MAX_SIGNAL_DATA_BYTES);
   }
 
   const signal = {
@@ -404,10 +735,19 @@ function handleRedLinkSignal(req, res) {
   };
 
   signals.push(signal);
-  res.json({ ok: true, service: "redlink-hub", version: VERSION, action: "signal-queued", signal });
+  pruneSignals();
+  res.json({
+    ok: true,
+    service: "redlink-hub",
+    version: VERSION,
+    action: "signal-queued",
+    signal: compactSignal(signal, false),
+    signalTtlMs: SIGNAL_MAX_AGE_MS,
+    retryAfterMs: POLL_RETRY_AFTER_MS
+  });
 }
 
-app.get("/api/redlink/signal", handleRedLinkSignal);
+app.get("/api/redlink/signal", (_req, res) => res.status(405).json({ ok: false, error: "method_not_allowed", hint: "Use POST /api/redlink/signal" }));
 app.post("/api/redlink/signal", handleRedLinkSignal);
 
 app.get("/api/redlink/poll", (req, res) => {
@@ -415,17 +755,34 @@ app.get("/api/redlink/poll", (req, res) => {
   const payload = payloadFrom(req);
   const instanceId = cleanString(payload.instanceId || payload.to);
   const roomKey = roomKeyFrom(payload);
-  const inbox = signals.filter((signal) => signal.roomKey === roomKey
-    && (!signal.to || signal.to === instanceId)
-    && signal.from !== instanceId);
+  const limit = intParam(payload.limit, MAX_POLL_SIGNALS, 1, MAX_POLL_SIGNALS);
+  const inbox = signals
+    .filter((signal) => signal.roomKey === roomKey
+      && (!signal.to || signal.to === instanceId)
+      && signal.from !== instanceId)
+    .slice(0, limit);
+  const boundedInbox = boundedSignalsForResponse(inbox, true);
+  const deliveredIds = new Set(boundedInbox.filter((signal) => signal.to === instanceId).map((signal) => signal.id));
 
-  // 0.5.0.8.1: targeted RedLink signals behave as a lightweight mailbox, not an endless broadcast log.
-  // Once a target polls them, remove them from the hub so old DM retries do not flood the UI forever.
-  signals = signals.filter((signal) => !(signal.roomKey === roomKey
-    && signal.to === instanceId
-    && signal.from !== instanceId));
+  signals = signals.filter((signal) => !deliveredIds.has(signal.id));
 
-  res.json({ ok: true, service: "redlink-hub", version: VERSION, layer: "redlink-signaling-poll", roomKey, instanceId, signals: inbox, generatedAt: now() });
+  res.set("Cache-Control", "no-store");
+  res.set("X-RedLink-Retry-After-Ms", String(POLL_RETRY_AFTER_MS));
+  res.json({
+    ok: true,
+    service: "redlink-hub",
+    version: VERSION,
+    layer: "redlink-signaling-poll",
+    roomKey,
+    instanceId,
+    signalCount: inbox.length,
+    returnedSignalCount: boundedInbox.length,
+    limit,
+    retryAfterMs: POLL_RETRY_AFTER_MS,
+    boundedByBytes: MAX_RESPONSE_BYTES,
+    signals: boundedInbox,
+    generatedAt: now()
+  });
 });
 
 function safeTransferId(value) {
@@ -459,14 +816,14 @@ function writeTransferMeta(id, meta) {
 }
 
 function cloudFileRelayDisabled(res, action = "file-transfer") {
-  return res.status(403).json({
+  return res.status(410).json({
     ok: false,
     service: "redlink-hub",
     version: VERSION,
     action,
     error: "cloud_file_relay_disabled",
-    policy: "file_teleport_direct_p2p_default",
-    hint: "Cloud RedLink is tracker/signaling only. Enable REDBOX_ALLOW_CLOUD_FILE_RELAY=1 only for explicit temporary fallback tests."
+    policy: "no_cloud_payload_storage_or_download",
+    hint: "Cloud RedLink is presence/signaling/discovery only. File payloads must use direct P2P or client-side donor routes."
   });
 }
 
@@ -556,7 +913,7 @@ app.use((req, res) => {
     ok: false,
     error: "route_not_found",
     path: req.path,
-    available: ["/", "/health", "/api/health", "/api/debug/presence", "/api/debug/signals", "/api/presence", "/api/register", "/api/native/register", "/api/native/heartbeat", "/api/native/goodbye", "/api/redlink/discover", "/api/redlink/signal", "/api/redlink/poll", "/api/redlink/file-transfer/start", "/api/redlink/file-transfer/chunk", "/api/redlink/file-transfer/complete", "/api/redlink/file-transfer/download/:transferId"]
+    available: ["/", "/health", "/api/health", "/api/board/status", "/api/diagnostics/bandwidth", "/api/presence", "/api/register", "/api/native/register", "/api/native/heartbeat", "/api/native/goodbye", "/api/redlink/discover", "POST /api/redlink/signal", "/api/redlink/poll"]
   });
 });
 
@@ -564,4 +921,4 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`RedLink Hub ${VERSION} running on ${PORT}`);
 });
 
-// --- КОНЕЦ ФАЙЛА ---
+// --- END FILE ---

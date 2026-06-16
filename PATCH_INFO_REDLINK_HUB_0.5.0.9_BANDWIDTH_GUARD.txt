@@ -1,0 +1,43 @@
+RedLink Hub 0.5.0.9 Bandwidth Guard
+Date: 2026-06-16 Europe/Moscow
+
+Incident:
+- Render workspace was suspended after exceeding 5 GB free bandwidth.
+- Public debug endpoints and large signaling/file payload responses are treated as bandwidth-risk surfaces.
+
+Policy:
+- RedLink Hub is a lightweight public/semi-public announcement board for presence/signaling/discovery only.
+- The primary architecture is not "hide the board behind a token"; the primary architecture is "only small, short-lived announcements are allowed on the board".
+- It must not store or serve large queues, chat history, file payloads, base64 chunks, thumbnails, previews, or long debug dumps.
+
+Changes:
+- Request body limit reduced from 8mb to 64kb by default (REDLINK_BODY_LIMIT can tune it).
+- Public board/diagnostic endpoints were added: /api/board/status and /api/diagnostics/bandwidth.
+- /api/debug/presence and /api/debug/signals are no longer production mechanisms; they are disabled unless REDLINK_DEBUG=1 or NODE_ENV=development.
+- Detailed debug endpoints support REDLINK_DEBUG_TOKEN through x-redlink-debug-token / debugToken / token.
+- /api/debug/signals is paginated and compact; signal payload data is hidden unless includeData=1.
+- Signal store has TTL/pruning/caps: REDLINK_SIGNAL_MAX_AGE_MS, REDLINK_MAX_SIGNALS, REDLINK_MAX_SIGNAL_STORE_BYTES.
+- /api/redlink/poll has max page size and retryAfterMs/backoff hints.
+- /api/redlink/poll has a max response byte cap and removes targeted signals only after they were actually returned in the bounded response.
+- /api/redlink/signal is POST-only; GET returns 405.
+- Signal POST response is compact and no longer echoes full signal data back to sender.
+- Cloud file relay is hard-disabled and returns 410. P2P/direct donor routes must carry files.
+- Presence/discovery/register responses return compact participant records and capped member lists.
+- Basic per-IP rate limiter returns 429 with Retry-After.
+- Lightweight in-memory bandwidth counters track top endpoints and hashed clients without storing payload.
+
+Default limits:
+- REDLINK_BODY_LIMIT=64kb
+- REDLINK_SIGNAL_MAX_AGE_MS<=120000 ms
+- REDLINK_MAX_SIGNALS=600
+- REDLINK_MAX_POLL_SIGNALS=20
+- REDLINK_MAX_PRESENCE_MEMBERS=80
+- REDLINK_MAX_SIGNAL_DATA_BYTES=16384
+- REDLINK_MAX_RESPONSE_BYTES=65536
+- REDLINK_MAX_SIGNAL_STORE_BYTES=1048576
+- REDLINK_POLL_RETRY_AFTER_MS=5000
+- REDLINK_RATE_MAX=240 per REDLINK_RATE_WINDOW_MS=60000
+
+Validation:
+- node --check server.js passed.
+- Local smoke passed: health 200, board status 200, public bandwidth diagnostics 200, production debug signals 404, GET signal 405, cloud file relay 410, POST signal compact ack, poll bounded response.
